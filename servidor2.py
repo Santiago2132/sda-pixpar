@@ -2,691 +2,213 @@ import os
 import threading
 import time
 import json
-import socket
-import subprocess
-import re
-from flask import Flask, request, Response
+from flask import Flask, request, jsonify
 from flask_cors import CORS
 import xml.etree.ElementTree as ET
 import xmlrpc.client
-from datetime import datetime
-import uuid
-import schedule
-
-def obtener_ip_real():
-    """Obtiene la IP real de la máquina en la red local."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
-            if not ip.startswith("127."):
-                return ip
-    except:
-        pass
-    
-    try:
-        result = subprocess.run(['ip', 'route', 'get', '8.8.8.8'], 
-                              capture_output=True, text=True, timeout=3)
-        match = re.search(r'src (\d+\.\d+\.\d+\.\d+)', result.stdout)
-        if match:
-            return match.group(1)
-    except:
-        pass
-    
-    return "127.0.0.1"
+import base64
+from werkzeug.serving import make_server
 
 # Configuración
 BALANCEADOR_IP = "192.168.154.129"
 BALANCEADOR_RPC_URL = f"http://{BALANCEADOR_IP}:8000"
-SERVIDOR_IP = "192.168.154.130"  # IP fija del servidor SOAP
 
 app = Flask(__name__)
-CORS(app, origins="*", allow_headers=["Content-Type", "SOAPAction", "Authorization"], methods=["GET", "POST", "OPTIONS"])
+CORS(app, origins="*")
 
-class SOAPImageService:
-    """Servicio SOAP para procesamiento de imágenes con recarga automática"""
-    
+class GestorSOAP:
     def __init__(self):
         self.balanceador_client = None
-        self.tareas_activas = {}  # task_id -> info
-        self.resultados_completados = {}  # task_id -> resultado (cache persistente)
-        self.lock = threading.Lock()
-        self._conectar_balanceador()
+        self.resultados_cache = {}
         
-        # Iniciar hilos de monitoreo
-        threading.Thread(target=self._monitor_tareas, daemon=True).start()
-        threading.Thread(target=self._programar_recargas, daemon=True).start()
-        
-        # Configurar recarga automática cada 30 segundos
-        schedule.every(30).seconds.do(self._recarga_periodica)
-    
-    def _conectar_balanceador(self):
-        """Conecta con el balanceador RPC"""
-        try:
-            self.balanceador_client = xmlrpc.client.ServerProxy(BALANCEADOR_RPC_URL)
-            # Test de conectividad
-            self.balanceador_client.ping()
-            print(f"✅ Conectado al balanceador RPC: {BALANCEADOR_RPC_URL}")
-        except Exception as e:
-            print(f"❌ Error conectando con balanceador RPC: {e}")
-            self.balanceador_client = None
-    
-    def _programar_recargas(self):
-        """Ejecuta las recargas programadas"""
-        while True:
-            schedule.run_pending()
-            time.sleep(1)
-    
-    def _recarga_periodica(self):
-        """Recarga periódica del estado de las tareas"""
-        print(f"🔄 Recarga automática iniciada - {datetime.now().strftime('%H:%M:%S')}")
-        
-        if not self.balanceador_client:
-            self._conectar_balanceador()
-            if not self.balanceador_client:
-                print("❌ No se puede conectar al balanceador para recarga")
-                return
-        
-        with self.lock:
-            tareas_pendientes = [tid for tid, info in self.tareas_activas.items() 
-                               if info["status"] == "procesando"]
-        
-        if tareas_pendientes:
-            print(f"📋 Verificando {len(tareas_pendientes)} tareas pendientes...")
-            
-            for task_id in tareas_pendientes:
-                self._verificar_tarea_individual(task_id)
-        else:
-            print("✅ No hay tareas pendientes para verificar")
-    
-    def _monitor_tareas(self):
-        """Monitorea constantemente las tareas activas"""
-        while True:
+    def get_balanceador_client(self):
+        if self.balanceador_client is None:
             try:
-                if not self.balanceador_client:
-                    self._conectar_balanceador()
-                    time.sleep(5)
-                    continue
-                
-                with self.lock:
-                    tareas_a_verificar = [tid for tid, info in self.tareas_activas.items() 
-                                        if info["status"] == "procesando"]
-                
-                for task_id in tareas_a_verificar:
-                    self._verificar_tarea_individual(task_id)
-                
-                # Limpiar tareas antiguas (más de 1 hora)
-                self._limpiar_tareas_antiguas()
-                
-                time.sleep(2)  # Verificar cada 2 segundos
-                
+                self.balanceador_client = xmlrpc.client.ServerProxy(BALANCEADOR_RPC_URL)
+                self.balanceador_client.ping()
+                print(f"Conectado con balanceador RPC: {BALANCEADOR_RPC_URL}")
             except Exception as e:
-                print(f"Error en monitor de tareas: {e}")
-                time.sleep(5)
+                print(f"Error conectando con balanceador: {e}")
+                self.balanceador_client = None
+        return self.balanceador_client
     
-    def _verificar_tarea_individual(self, task_id):
-        """Verifica el estado de una tarea individual"""
+    def procesar_imagenes_async(self, xml_content, prioridad, tipo_servicio, formato_salida, calidad):
         try:
-            resultado_json = self.balanceador_client.obtener_resultado(task_id)
+            client = self.get_balanceador_client()
+            if not client:
+                return {"error": "No se puede conectar con el balanceador", "task_id": None}
+            
+            # Validar XML
+            try:
+                ET.fromstring(xml_content)
+            except:
+                return {"error": "XML malformado", "task_id": None}
+            
+            # Enviar tarea al balanceador via RPC
+            task_id = client.procesar_tarea(xml_content, prioridad, tipo_servicio, formato_salida, calidad)
+            
+            if task_id:
+                self.resultados_cache[task_id] = {"status": "procesando", "timestamp": time.time()}
+                
+                # Iniciar monitoreo asíncrono
+                threading.Thread(target=self._monitorear_tarea, args=(task_id,), daemon=True).start()
+                
+                return {
+                    "task_id": task_id,
+                    "status": "accepted",
+                    "message": "Tarea enviada al balanceador"
+                }
+            else:
+                return {"error": "Error procesando tarea en balanceador", "task_id": None}
+                
+        except Exception as e:
+            return {"error": f"Error del servidor SOAP: {str(e)}", "task_id": None}
+    
+    def obtener_resultado_tarea(self, task_id):
+        try:
+            client = self.get_balanceador_client()
+            if not client:
+                return {"status": "error", "error": "No se puede conectar con el balanceador"}
+            
+            resultado_json = client.obtener_resultado(task_id)
+            
             if resultado_json:
                 resultado = json.loads(resultado_json)
-                
-                with self.lock:
-                    if task_id in self.tareas_activas:
-                        if resultado["status"] == "completado":
-                            # Mover a resultados completados
-                            self.resultados_completados[task_id] = {
-                                "status": "completado",
-                                "xml_result": resultado["resultado"],
-                                "tiempo_proceso": resultado.get("tiempo_proceso", 0),
-                                "nodo_procesado": resultado.get("nodo_procesado", ""),
-                                "timestamp_completado": time.time()
-                            }
-                            # Actualizar tarea activa
-                            self.tareas_activas[task_id].update(self.resultados_completados[task_id])
-                            print(f"✅ Tarea {task_id} completada y cacheada")
-                            
-                        elif resultado["status"] == "error":
-                            self.tareas_activas[task_id]["status"] = "error"
-                            self.tareas_activas[task_id]["error"] = resultado.get("error", "Error desconocido")
-                            print(f"❌ Tarea {task_id} falló: {resultado.get('error', 'Error desconocido')}")
-        
-        except Exception as e:
-            print(f"Error verificando tarea {task_id}: {e}")
-    
-    def _limpiar_tareas_antiguas(self):
-        """Limpia tareas antiguas para evitar acumulación de memoria"""
-        tiempo_actual = time.time()
-        tiempo_limite = 3600  # 1 hora
-        
-        with self.lock:
-            # Limpiar tareas activas antiguas completadas
-            tareas_a_limpiar = []
-            for task_id, info in self.tareas_activas.items():
-                if (tiempo_actual - info["timestamp"] > tiempo_limite and 
-                    info["status"] in ["completado", "error"]):
-                    tareas_a_limpiar.append(task_id)
-            
-            for task_id in tareas_a_limpiar:
-                del self.tareas_activas[task_id]
-                print(f"🗑️ Tarea antigua limpiada: {task_id}")
-            
-            # Limpiar cache de resultados (mantener solo las últimas 2 horas)
-            resultados_a_limpiar = []
-            for task_id, info in self.resultados_completados.items():
-                if tiempo_actual - info.get("timestamp_completado", 0) > 7200:  # 2 horas
-                    resultados_a_limpiar.append(task_id)
-            
-            for task_id in resultados_a_limpiar:
-                del self.resultados_completados[task_id]
-    
-    def procesar_imagenes_auto(self, xml_content, prioridad=5, tipo_servicio="procesamiento_batch", 
-                              formato_salida="JPEG", calidad=85, poll_interval=3.0, max_attempts=30):
-        """Procesa imágenes de forma automática con polling hasta completar"""
-        try:
-            if not self.balanceador_client:
-                self._conectar_balanceador()
-                if not self.balanceador_client:
-                    raise Exception("No se puede conectar con el balanceador")
-            
-            # Enviar tarea al balanceador
-            task_id = self.balanceador_client.procesar_tarea(
-                xml_content, prioridad, tipo_servicio, formato_salida, calidad
-            )
-            
-            if not task_id:
-                raise Exception("Error al crear tarea en el balanceador")
-            
-            # Registrar tarea
-            with self.lock:
-                self.tareas_activas[task_id] = {
-                    "status": "procesando",
-                    "timestamp": time.time(),
-                    "xml_content": xml_content,
-                    "prioridad": prioridad
+                self.resultados_cache[task_id] = {
+                    "status": resultado.get("status", "unknown"),
+                    "resultado": resultado,
+                    "timestamp": time.time()
                 }
-            
-            print(f"🚀 Tarea {task_id} creada, iniciando polling...")
-            
-            # Polling hasta completar
-            attempts = 0
-            while attempts < max_attempts:
-                time.sleep(poll_interval)
-                attempts += 1
+                return resultado
+            else:
+                return {"status": "not_found", "message": "Tarea no encontrada"}
                 
-                # Verificar si ya está en cache
-                with self.lock:
-                    if task_id in self.resultados_completados:
-                        resultado_cache = self.resultados_completados[task_id]
-                        return {
-                            "success": True,
-                            "task_id": task_id,
-                            "xml_result": resultado_cache["xml_result"],
-                            "tiempo_proceso": resultado_cache.get("tiempo_proceso", 0),
-                            "nodo_procesado": resultado_cache.get("nodo_procesado", ""),
-                            "attempts": attempts,
-                            "from_cache": True
-                        }
-                    
-                    if task_id in self.tareas_activas:
-                        tarea_info = self.tareas_activas[task_id]
-                        
-                        if tarea_info["status"] == "completado":
-                            return {
-                                "success": True,
-                                "task_id": task_id,
-                                "xml_result": tarea_info["xml_result"],
-                                "tiempo_proceso": tarea_info.get("tiempo_proceso", 0),
-                                "nodo_procesado": tarea_info.get("nodo_procesado", ""),
-                                "attempts": attempts
-                            }
-                        elif tarea_info["status"] == "error":
-                            error_msg = tarea_info.get("error", "Error desconocido")
-                            return {
-                                "success": False,
-                                "error": error_msg,
-                                "task_id": task_id
-                            }
-            
-            # Timeout
-            return {
-                "success": False,
-                "error": f"Timeout después de {max_attempts} intentos",
-                "task_id": task_id
-            }
-            
         except Exception as e:
-            return {
-                "success": False,
-                "error": f"Error del servidor: {str(e)}"
-            }
+            return {"status": "error", "error": f"Error consultando resultado: {str(e)}"}
     
-    def obtener_estado_tarea(self, task_id):
-        """Obtiene el estado actual de una tarea específica"""
-        with self.lock:
-            # Buscar en resultados completados primero
-            if task_id in self.resultados_completados:
-                return self.resultados_completados[task_id]
-            
-            # Buscar en tareas activas
-            if task_id in self.tareas_activas:
-                return self.tareas_activas[task_id]
-        
-        return None
-    
-    def obtener_estadisticas(self):
-        """Obtiene estadísticas del sistema"""
+    def obtener_estadisticas_sistema(self):
         try:
-            if not self.balanceador_client:
-                self._conectar_balanceador()
-                if not self.balanceador_client:
-                    return {"error": "No conectado al balanceador"}
+            client = self.get_balanceador_client()
+            if not client:
+                return {"error": "No se puede conectar con el balanceador"}
             
-            stats_json = self.balanceador_client.obtener_estadisticas()
+            stats_json = client.obtener_estadisticas()
             if stats_json:
-                stats = json.loads(stats_json)
-                
-                # Agregar estadísticas del servidor SOAP
-                with self.lock:
-                    tareas_activas_count = len([t for t in self.tareas_activas.values() 
-                                              if t["status"] == "procesando"])
-                    tareas_completadas_count = len(self.resultados_completados)
-                    
-                    stats["servidor_soap"] = {
-                        "tareas_activas_soap": tareas_activas_count,
-                        "tareas_completadas_cache": tareas_completadas_count,
-                        "total_tareas_registradas": len(self.tareas_activas),
-                        "balanceador_conectado": self.balanceador_client is not None,
-                        "recarga_automatica": True,
-                        "servidor_ip": SERVIDOR_IP
-                    }
-                
-                return stats
+                return json.loads(stats_json)
             else:
                 return {"error": "No se pudieron obtener estadísticas"}
                 
         except Exception as e:
             return {"error": f"Error obteniendo estadísticas: {str(e)}"}
-
-
-# Instancia global del servicio
-soap_service = SOAPImageService()
-
-@app.route('/soap', methods=['POST', 'OPTIONS'])
-def soap_endpoint():
-    """Endpoint principal SOAP"""
-    if request.method == 'OPTIONS':
-        response = Response()
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        response.headers.add("Access-Control-Allow-Headers", "Content-Type, SOAPAction, Authorization")
-        response.headers.add("Access-Control-Allow-Methods", "POST, OPTIONS")
-        return response
     
-    try:
-        # Obtener contenido SOAP
-        soap_content = request.data.decode('utf-8')
+    def _monitorear_tarea(self, task_id):
+        max_intentos = 60
+        intentos = 0
         
-        # Parsear SOAP request
-        soap_tree = ET.fromstring(soap_content)
-        
-        # Buscar el método solicitado
-        body = soap_tree.find('.//{http://schemas.xmlsoap.org/soap/envelope/}Body')
-        if body is None:
-            return crear_soap_fault("Client", "No se encontró el cuerpo SOAP")
-        
-        # Buscar operación
-        operacion = None
-        for child in body:
-            if child.tag.endswith('}procesarImagenesAuto'):
-                operacion = 'procesarImagenesAuto'
+        while intentos < max_intentos:
+            try:
+                time.sleep(5)
+                intentos += 1
+                
+                client = self.get_balanceador_client()
+                if not client:
+                    break
+                
+                resultado_json = client.obtener_resultado(task_id)
+                if resultado_json:
+                    resultado = json.loads(resultado_json)
+                    status = resultado.get("status", "unknown")
+                    
+                    self.resultados_cache[task_id] = {
+                        "status": status,
+                        "resultado": resultado,
+                        "timestamp": time.time()
+                    }
+                    
+                    if status in ["completado", "error"]:
+                        print(f"Tarea {task_id} finalizada: {status}")
+                        break
+                        
+            except Exception as e:
+                print(f"Error monitoreando tarea {task_id}: {e}")
                 break
-            elif child.tag.endswith('}obtenerEstadisticas'):
-                operacion = 'obtenerEstadisticas'
-                break
-            elif child.tag.endswith('}obtenerEstadoTarea'):
-                operacion = 'obtenerEstadoTarea'
-                break
-        
-        if not operacion:
-            return crear_soap_fault("Client", "Operación no reconocida")
-        
-        # Ejecutar operación
-        if operacion == 'procesarImagenesAuto':
-            return manejar_procesar_imagenes_auto(body)
-        elif operacion == 'obtenerEstadisticas':
-            return manejar_obtener_estadisticas()
-        elif operacion == 'obtenerEstadoTarea':
-            return manejar_obtener_estado_tarea(body)
-        
-    except ET.ParseError as e:
-        return crear_soap_fault("Client", f"SOAP XML malformado: {str(e)}")
-    except Exception as e:
-        return crear_soap_fault("Server", f"Error del servidor: {str(e)}")
 
-def manejar_obtener_estado_tarea(body):
-    """Maneja la operación obtenerEstadoTarea"""
-    try:
-        ns = {'tns': 'http://servidor.procesamiento.imagenes/soap'}
-        operacion_elem = body.find('.//{http://servidor.procesamiento.imagenes/soap}obtenerEstadoTarea')
-        
-        task_id = operacion_elem.findtext('.//tns:task_id', '', ns)
-        
-        if not task_id:
-            return crear_soap_fault("Client", "task_id requerido")
-        
-        estado = soap_service.obtener_estado_tarea(task_id)
-        
-        if not estado:
-            soap_response = f"""<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:tns="http://servidor.procesamiento.imagenes/soap">
-    <soap:Body>
-        <tns:obtenerEstadoTareaResponse>
-            <tns:status>not_found</tns:status>
-            <tns:message>Tarea no encontrada</tns:message>
-        </tns:obtenerEstadoTareaResponse>
-    </soap:Body>
-</soap:Envelope>"""
-        else:
-            estado_json = json.dumps(estado)
-            soap_response = f"""<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:tns="http://servidor.procesamiento.imagenes/soap">
-    <soap:Body>
-        <tns:obtenerEstadoTareaResponse>
-            <tns:status>found</tns:status>
-            <tns:estado>{estado_json}</tns:estado>
-        </tns:obtenerEstadoTareaResponse>
-    </soap:Body>
-</soap:Envelope>"""
-        
-        response = Response(soap_response)
-        response.headers['Content-Type'] = 'text/xml; charset=utf-8'
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        return response
-        
-    except Exception as e:
-        return crear_soap_fault("Server", f"Error obteniendo estado de tarea: {str(e)}")
+# Instancia global del gestor
+gestor = GestorSOAP()
 
-def manejar_procesar_imagenes_auto(body):
-    """Maneja la operación procesarImagenesAuto"""
+@app.route('/procesar_imagenes', methods=['POST'])
+def procesar_imagenes():
     try:
-        # Extraer parámetros SOAP
-        ns = {'tns': 'http://servidor.procesamiento.imagenes/soap'}
+        data = request.get_json()
         
-        operacion_elem = body.find('.//{http://servidor.procesamiento.imagenes/soap}procesarImagenesAuto')
+        xml_content = data.get('xml_content', '')
+        prioridad = data.get('prioridad', 3)
+        tipo_servicio = data.get('tipo_servicio', 'procesamiento_batch')
+        formato_salida = data.get('formato_salida', 'JPEG')
+        calidad = data.get('calidad', 85)
         
-        xml_content = operacion_elem.findtext('.//tns:xml_content', '', ns)
-        prioridad = int(operacion_elem.findtext('.//tns:prioridad', '5', ns))
-        tipo_servicio = operacion_elem.findtext('.//tns:tipo_servicio', 'procesamiento_batch', ns)
-        formato_salida = operacion_elem.findtext('.//tns:formato_salida', 'JPEG', ns)
-        calidad = int(operacion_elem.findtext('.//tns:calidad', '85', ns))
-        poll_interval = float(operacion_elem.findtext('.//tns:poll_interval', '3.0', ns))
-        max_attempts = int(operacion_elem.findtext('.//tns:max_attempts', '30', ns))
-        
-        if not xml_content:
-            return crear_soap_fault("Client", "xml_content requerido")
-        
-        # Validar XML
-        try:
-            ET.fromstring(xml_content)
-        except:
-            return crear_soap_fault("Client", "xml_content malformado")
-        
-        print(f"🎯 Procesando imágenes automáticamente - Prioridad: {prioridad}, Formato: {formato_salida}")
-        
-        # Procesar
-        resultado = soap_service.procesar_imagenes_auto(
-            xml_content=xml_content,
-            prioridad=prioridad,
-            tipo_servicio=tipo_servicio,
-            formato_salida=formato_salida,
-            calidad=calidad,
-            poll_interval=poll_interval,
-            max_attempts=max_attempts
+        resultado = gestor.procesar_imagenes_async(
+            xml_content, prioridad, tipo_servicio, formato_salida, calidad
         )
         
-        if resultado["success"]:
-            from_cache = resultado.get("from_cache", False)
-            soap_response = f"""<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:tns="http://servidor.procesamiento.imagenes/soap">
-    <soap:Body>
-        <tns:procesarImagenesAutoResponse>
-            <tns:status>success</tns:status>
-            <tns:task_id>{resultado['task_id']}</tns:task_id>
-            <tns:xml_result>{resultado['xml_result']}</tns:xml_result>
-            <tns:tiempo_proceso>{resultado.get('tiempo_proceso', 0)}</tns:tiempo_proceso>
-            <tns:nodo_procesado>{resultado.get('nodo_procesado', '')}</tns:nodo_procesado>
-            <tns:attempts>{resultado.get('attempts', 0)}</tns:attempts>
-            <tns:from_cache>{str(from_cache).lower()}</tns:from_cache>
-        </tns:procesarImagenesAutoResponse>
-    </soap:Body>
-</soap:Envelope>"""
-        else:
-            soap_response = f"""<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:tns="http://servidor.procesamiento.imagenes/soap">
-    <soap:Body>
-        <tns:procesarImagenesAutoResponse>
-            <tns:status>error</tns:status>
-            <tns:error>{resultado['error']}</tns:error>
-            <tns:task_id>{resultado.get('task_id', '')}</tns:task_id>
-        </tns:procesarImagenesAutoResponse>
-    </soap:Body>
-</soap:Envelope>"""
-        
-        response = Response(soap_response)
-        response.headers['Content-Type'] = 'text/xml; charset=utf-8'
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        return response
-        
+        return jsonify(resultado)
     except Exception as e:
-        return crear_soap_fault("Server", f"Error procesando imágenes: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
-def manejar_obtener_estadisticas():
-    """Maneja la operación obtenerEstadisticas"""
+@app.route('/obtener_resultado/<task_id>', methods=['GET'])
+def obtener_resultado(task_id):
     try:
-        estadisticas = soap_service.obtener_estadisticas()
-        stats_json = json.dumps(estadisticas)
-        
-        soap_response = f"""<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/"
-               xmlns:tns="http://servidor.procesamiento.imagenes/soap">
-    <soap:Body>
-        <tns:obtenerEstadisticasResponse>
-            <tns:estadisticas>{stats_json}</tns:estadisticas>
-        </tns:obtenerEstadisticasResponse>
-    </soap:Body>
-</soap:Envelope>"""
-        
-        response = Response(soap_response)
-        response.headers['Content-Type'] = 'text/xml; charset=utf-8'
-        response.headers.add("Access-Control-Allow-Origin", "*")
-        return response
-        
+        resultado = gestor.obtener_resultado_tarea(task_id)
+        return jsonify(resultado)
     except Exception as e:
-        return crear_soap_fault("Server", f"Error obteniendo estadísticas: {str(e)}")
+        return jsonify({"error": str(e)}), 500
 
-def crear_soap_fault(fault_code, fault_string):
-    """Crea una respuesta SOAP Fault"""
-    fault_response = f"""<?xml version="1.0" encoding="UTF-8"?>
-<soap:Envelope xmlns:soap="http://schemas.xmlsoap.org/soap/envelope/">
-    <soap:Body>
-        <soap:Fault>
-            <faultcode>{fault_code}</faultcode>
-            <faultstring>{fault_string}</faultstring>
-        </soap:Fault>
-    </soap:Body>
-</soap:Envelope>"""
-    
-    response = Response(fault_response, status=500)
-    response.headers['Content-Type'] = 'text/xml; charset=utf-8'
-    response.headers.add("Access-Control-Allow-Origin", "*")
-    return response
-
-@app.route('/soap', methods=['GET'])
-def wsdl_endpoint():
-    """Endpoint para WSDL con nueva operación"""
-    wsdl_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<definitions xmlns="http://schemas.xmlsoap.org/wsdl/"
-             xmlns:tns="http://servidor.procesamiento.imagenes/soap"
-             xmlns:soap="http://schemas.xmlsoap.org/wsdl/soap/"
-             xmlns:xsd="http://www.w3.org/2001/XMLSchema"
-             targetNamespace="http://servidor.procesamiento.imagenes/soap">
-
-    <message name="procesarImagenesAutoRequest">
-        <part name="xml_content" type="xsd:string"/>
-        <part name="prioridad" type="xsd:int"/>
-        <part name="tipo_servicio" type="xsd:string"/>
-        <part name="formato_salida" type="xsd:string"/>
-        <part name="calidad" type="xsd:int"/>
-        <part name="poll_interval" type="xsd:float"/>
-        <part name="max_attempts" type="xsd:int"/>
-    </message>
-    
-    <message name="procesarImagenesAutoResponse">
-        <part name="status" type="xsd:string"/>
-        <part name="task_id" type="xsd:string"/>
-        <part name="xml_result" type="xsd:string"/>
-        <part name="error" type="xsd:string"/>
-        <part name="from_cache" type="xsd:boolean"/>
-    </message>
-    
-    <message name="obtenerEstadoTareaRequest">
-        <part name="task_id" type="xsd:string"/>
-    </message>
-    
-    <message name="obtenerEstadoTareaResponse">
-        <part name="status" type="xsd:string"/>
-        <part name="estado" type="xsd:string"/>
-    </message>
-    
-    <message name="obtenerEstadisticasRequest"/>
-    
-    <message name="obtenerEstadisticasResponse">
-        <part name="estadisticas" type="xsd:string"/>
-    </message>
-
-    <portType name="ImageProcessingPortType">
-        <operation name="procesarImagenesAuto">
-            <input message="tns:procesarImagenesAutoRequest"/>
-            <output message="tns:procesarImagenesAutoResponse"/>
-        </operation>
-        <operation name="obtenerEstadoTarea">
-            <input message="tns:obtenerEstadoTareaRequest"/>
-            <output message="tns:obtenerEstadoTareaResponse"/>
-        </operation>
-        <operation name="obtenerEstadisticas">
-            <input message="tns:obtenerEstadisticasRequest"/>
-            <output message="tns:obtenerEstadisticasResponse"/>
-        </operation>
-    </portType>
-
-    <binding name="ImageProcessingBinding" type="tns:ImageProcessingPortType">
-        <soap:binding transport="http://schemas.xmlsoap.org/soap/http"/>
-        <operation name="procesarImagenesAuto">
-            <soap:operation soapAction="procesarImagenesAuto"/>
-            <input>
-                <soap:body use="literal"/>
-            </input>
-            <output>
-                <soap:body use="literal"/>
-            </output>
-        </operation>
-        <operation name="obtenerEstadoTarea">
-            <soap:operation soapAction="obtenerEstadoTarea"/>
-            <input>
-                <soap:body use="literal"/>
-            </input>
-            <output>
-                <soap:body use="literal"/>
-            </output>
-        </operation>
-        <operation name="obtenerEstadisticas">
-            <soap:operation soapAction="obtenerEstadisticas"/>
-            <input>
-                <soap:body use="literal"/>
-            </input>
-            <output>
-                <soap:body use="literal"/>
-            </output>
-        </operation>
-    </binding>
-
-    <service name="ImageProcessingService">
-        <port name="ImageProcessingPort" binding="tns:ImageProcessingBinding">
-            <soap:address location="http://{SERVIDOR_IP}:8080/soap"/>
-        </port>
-    </service>
-
-</definitions>"""
-    
-    response = Response(wsdl_content)
-    response.headers['Content-Type'] = 'text/xml; charset=utf-8'
-    response.headers.add("Access-Control-Allow-Origin", "*")
-    return response
+@app.route('/estadisticas', methods=['GET'])
+def estadisticas():
+    try:
+        stats = gestor.obtener_estadisticas_sistema()
+        return jsonify(stats)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
-    """Health check del servidor SOAP"""
-    with soap_service.lock:
-        tareas_activas = len([t for t in soap_service.tareas_activas.values() 
-                            if t["status"] == "procesando"])
-        cache_size = len(soap_service.resultados_completados)
+    try:
+        client = xmlrpc.client.ServerProxy(BALANCEADOR_RPC_URL)
+        client.ping()
+        balanceador_status = "connected"
+    except:
+        balanceador_status = "disconnected"
     
-    return {
+    return jsonify({
         "status": "healthy",
-        "service": "Servidor SOAP - Procesamiento de Imágenes",
+        "service": "Servidor SOAP - Intermediario de Procesamiento de Imágenes",
         "timestamp": time.time(),
-        "servidor_ip": SERVIDOR_IP,
-        "balanceador_conectado": soap_service.balanceador_client is not None,
-        "tareas_activas": tareas_activas,
-        "resultados_cache": cache_size,
-        "recarga_automatica": True
-    }
-
-@app.route('/reload', methods=['POST'])
-def manual_reload():
-    """Endpoint para recarga manual"""
-    soap_service._recarga_periodica()
-    return {"status": "reload_completed", "timestamp": time.time()}
+        "balanceador_status": balanceador_status,
+        "balanceador_url": BALANCEADOR_RPC_URL
+    })
 
 def main():
-    """Función principal"""
-    print("🌐 Iniciando Servidor SOAP Mejorado...")
-    print("=" * 50)
+    print("Iniciando Servidor SOAP Intermediario...")
     
-    puerto = 8080
+    ip_local = "192.168.154.130"
+    puerto = 5001
     
-    print("🎯 Configuración:")
-    print(f"  • IP Servidor SOAP: {SERVIDOR_IP}:{puerto} (IP fija)")
-    print(f"  • Balanceador RPC: {BALANCEADOR_IP}:8000")
-    print(f"  • Recarga automática: cada 30 segundos")
-    print(f"  • Cache persistente: habilitado")
+    print(f"Endpoints disponibles:")
+    print(f"  POST /procesar_imagenes - Procesar imágenes")
+    print(f"  GET /obtener_resultado/<task_id> - Obtener resultado")
+    print(f"  GET /estadisticas - Ver estadísticas")
+    print(f"  GET /health - Health check")
     
-    print("\n🛠 Servicios disponibles:")
-    print(f"  • POST /soap - Endpoint SOAP principal")
-    print(f"  • GET /soap?wsdl - WSDL del servicio")
-    print(f"  • GET /health - Health check")
-    print(f"  • POST /reload - Recarga manual")
-    
-    print("\n📋 Operaciones SOAP:")
-    print("  • procesarImagenesAuto - Procesa imágenes con polling automático")
-    print("  • obtenerEstadoTarea - Obtiene estado de una tarea específica")
-    print("  • obtenerEstadisticas - Obtiene estadísticas del sistema")
-    
-    print(f"\n🚀 Servidor SOAP ejecutándose en: {SERVIDOR_IP}:{puerto}")
-    print("📗 Comunicación: Cliente <-SOAP-> Servidor <-RPC-> Balanceador")
-    print("✅ CORS habilitado para desarrollo global")
-    print("🔄 Recarga automática habilitada")
-    print("🎯 Servidor listo... (Ctrl+C para detener)")
+    print(f"\nURL base: http://{ip_local}:{puerto}")
+    print(f"Balanceador: {BALANCEADOR_RPC_URL}")
+    print("Servidor ejecutándose...")
     
     try:
-        app.run(host=SERVIDOR_IP, port=puerto, debug=False, threaded=True)
+        server = make_server(ip_local, puerto, app)
+        server.serve_forever()
     except KeyboardInterrupt:
-        print("\n🛑 Deteniendo servidor SOAP...")
-        print("✅ Servidor detenido")
+        print("\nDeteniendo servidor...")
 
 if __name__ == "__main__":
     main()
