@@ -38,7 +38,7 @@ def obtener_ip_real():
 # CONFIGURACIÓN CORREGIDA - Usar IP dinámica
 BALANCEADOR_IP = "192.168.154.129"
 BALANCEADOR_RPC_URL = f"http://{BALANCEADOR_IP}:8000"
-SERVIDOR_IP = obtener_ip_real()  # CAMBIO: Detectar IP automáticamente
+SERVIDOR_IP = obtener_ip_real()  # Detectar IP automáticamente
 
 print(f"🔧 IP del servidor SOAP detectada: {SERVIDOR_IP}")
 
@@ -63,21 +63,32 @@ class SOAPImageService:
         schedule.every(30).seconds.do(self._recarga_periodica)
     
     def _conectar_balanceador(self):
-        """Conecta con el balanceador RPC"""
+        """Conecta con el balanceador RPC - VERSIÓN CORREGIDA"""
         try:
             print(f"🔄 Intentando conectar con balanceador: {BALANCEADOR_RPC_URL}")
-            self.balanceador_client = xmlrpc.client.ServerProxy(
-                BALANCEADOR_RPC_URL,
-                timeout=10  # AÑADIDO: timeout para evitar bloqueos
-            )
-            # Test de conectividad
-            response = self.balanceador_client.ping()
-            if response == "pong":
-                print(f"✅ Conectado al balanceador RPC: {BALANCEADOR_RPC_URL}")
-            else:
-                print(f"⚠️ Respuesta inesperada del balanceador: {response}")
+            
+            # CORREGIDO: Remover parámetro timeout que no existe en versiones anteriores
+            self.balanceador_client = xmlrpc.client.ServerProxy(BALANCEADOR_RPC_URL)
+            
+            # Test de conectividad con timeout manual usando socket
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(5)  # Timeout de 5 segundos
+            
+            try:
+                response = self.balanceador_client.ping()
+                if response == "pong":
+                    print(f"✅ Conectado al balanceador RPC: {BALANCEADOR_RPC_URL}")
+                else:
+                    print(f"⚠️ Respuesta inesperada del balanceador: {response}")
+                    self.balanceador_client = None
+            finally:
+                socket.setdefaulttimeout(old_timeout)  # Restaurar timeout original
+                
         except ConnectionError as e:
             print(f"❌ Error de conexión con balanceador RPC: {e}")
+            self.balanceador_client = None
+        except socket.timeout:
+            print(f"❌ Timeout conectando con balanceador RPC")
             self.balanceador_client = None
         except Exception as e:
             print(f"❌ Error conectando con balanceador RPC: {e}")
@@ -139,35 +150,43 @@ class SOAPImageService:
                 time.sleep(5)
     
     def _verificar_tarea_individual(self, task_id):
-        """Verifica el estado de una tarea individual"""
+        """Verifica el estado de una tarea individual - VERSIÓN CORREGIDA"""
         try:
-            # AÑADIDO: Manejo de timeout para evitar bloqueos
-            resultado_json = self.balanceador_client.obtener_resultado(task_id)
-            if resultado_json:
-                resultado = json.loads(resultado_json)
-                
-                with self.lock:
-                    if task_id in self.tareas_activas:
-                        if resultado["status"] == "completado":
-                            # Mover a resultados completados
-                            self.resultados_completados[task_id] = {
-                                "status": "completado",
-                                "xml_result": resultado["resultado"],
-                                "tiempo_proceso": resultado.get("tiempo_proceso", 0),
-                                "nodo_procesado": resultado.get("nodo_procesado", ""),
-                                "timestamp_completado": time.time()
-                            }
-                            # Actualizar tarea activa
-                            self.tareas_activas[task_id].update(self.resultados_completados[task_id])
-                            print(f"✅ Tarea {task_id} completada y cacheada")
-                            
-                        elif resultado["status"] == "error":
-                            self.tareas_activas[task_id]["status"] = "error"
-                            self.tareas_activas[task_id]["error"] = resultado.get("error", "Error desconocido")
-                            print(f"❌ Tarea {task_id} falló: {resultado.get('error', 'Error desconocido')}")
+            # CORREGIDO: Usar timeout manual con socket
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(3)  # Timeout de 3 segundos para verificaciones
+            
+            try:
+                resultado_json = self.balanceador_client.obtener_resultado(task_id)
+                if resultado_json:
+                    resultado = json.loads(resultado_json)
+                    
+                    with self.lock:
+                        if task_id in self.tareas_activas:
+                            if resultado["status"] == "completado":
+                                # Mover a resultados completados
+                                self.resultados_completados[task_id] = {
+                                    "status": "completado",
+                                    "xml_result": resultado["resultado"],
+                                    "tiempo_proceso": resultado.get("tiempo_proceso", 0),
+                                    "nodo_procesado": resultado.get("nodo_procesado", ""),
+                                    "timestamp_completado": time.time()
+                                }
+                                # Actualizar tarea activa
+                                self.tareas_activas[task_id].update(self.resultados_completados[task_id])
+                                print(f"✅ Tarea {task_id} completada y cacheada")
+                                
+                            elif resultado["status"] == "error":
+                                self.tareas_activas[task_id]["status"] = "error"
+                                self.tareas_activas[task_id]["error"] = resultado.get("error", "Error desconocido")
+                                print(f"❌ Tarea {task_id} falló: {resultado.get('error', 'Error desconocido')}")
+            finally:
+                socket.setdefaulttimeout(old_timeout)
         
         except xmlrpc.client.Fault as e:
             print(f"Error RPC verificando tarea {task_id}: {e}")
+        except socket.timeout:
+            print(f"Timeout verificando tarea {task_id}")
         except Exception as e:
             print(f"Error verificando tarea {task_id}: {e}")
             # Si hay error de conexión, marcar cliente como no disponible
@@ -203,7 +222,7 @@ class SOAPImageService:
     
     def procesar_imagenes_auto(self, xml_content, prioridad=5, tipo_servicio="procesamiento_batch", 
                               formato_salida="JPEG", calidad=85, poll_interval=3.0, max_attempts=30):
-        """Procesa imágenes de forma automática con polling hasta completar"""
+        """Procesa imágenes de forma automática con polling hasta completar - VERSIÓN CORREGIDA"""
         try:
             if not self.balanceador_client:
                 print("⚠️ Cliente RPC no disponible, intentando conectar...")
@@ -213,10 +232,16 @@ class SOAPImageService:
             
             print(f"📨 Enviando tarea al balanceador - Prioridad: {prioridad}")
             
-            # Enviar tarea al balanceador
-            task_id = self.balanceador_client.procesar_tarea(
-                xml_content, prioridad, tipo_servicio, formato_salida, calidad
-            )
+            # Enviar tarea al balanceador con timeout manual
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(10)  # Timeout de 10 segundos para crear tarea
+            
+            try:
+                task_id = self.balanceador_client.procesar_tarea(
+                    xml_content, prioridad, tipo_servicio, formato_salida, calidad
+                )
+            finally:
+                socket.setdefaulttimeout(old_timeout)
             
             if not task_id:
                 raise Exception("Error al crear tarea en el balanceador")
@@ -295,6 +320,12 @@ class SOAPImageService:
                 "success": False,
                 "error": f"Error RPC del balanceador: {str(e)}"
             }
+        except socket.timeout:
+            print(f"❌ Timeout en comunicación RPC")
+            return {
+                "success": False,
+                "error": "Timeout en comunicación con balanceador"
+            }
         except Exception as e:
             print(f"❌ Error del servidor SOAP: {e}")
             return {
@@ -323,7 +354,15 @@ class SOAPImageService:
                 if not self.balanceador_client:
                     return {"error": "No conectado al balanceador"}
             
-            stats_json = self.balanceador_client.obtener_estadisticas()
+            # CORREGIDO: Usar timeout manual con socket
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(5)
+            
+            try:
+                stats_json = self.balanceador_client.obtener_estadisticas()
+            finally:
+                socket.setdefaulttimeout(old_timeout)
+                
             if stats_json:
                 stats = json.loads(stats_json)
                 
@@ -568,7 +607,7 @@ def crear_soap_fault(fault_code, fault_string):
 
 @app.route('/soap', methods=['GET'])
 def wsdl_endpoint():
-    """Endpoint para WSDL con nueva operación"""
+    """Endpoint para WSDL"""
     wsdl_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <definitions xmlns="http://schemas.xmlsoap.org/wsdl/"
              xmlns:tns="http://servidor.procesamiento.imagenes/soap"
@@ -702,13 +741,19 @@ def test_balanceador_connection():
             soap_service._conectar_balanceador()
         
         if soap_service.balanceador_client:
-            response = soap_service.balanceador_client.ping()
-            return {
-                "status": "success",
-                "message": f"Conexión exitosa con balanceador: {response}",
-                "balanceador_url": BALANCEADOR_RPC_URL,
-                "timestamp": time.time()
-            }
+            old_timeout = socket.getdefaulttimeout()
+            socket.setdefaulttimeout(3)
+            
+            try:
+                response = soap_service.balanceador_client.ping()
+                return {
+                    "status": "success",
+                    "message": f"Conexión exitosa con balanceador: {response}",
+                    "balanceador_url": BALANCEADOR_RPC_URL,
+                    "timestamp": time.time()
+                }
+            finally:
+                socket.setdefaulttimeout(old_timeout)
         else:
             return {
                 "status": "error",
