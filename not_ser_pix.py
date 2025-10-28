@@ -1,4 +1,4 @@
-# server2.py
+# not_ser_pix.py
 import os
 import time
 from flask import Flask, request, Response
@@ -18,24 +18,24 @@ def recibir_notificacion():
     
     try:
         data = request.json
-        evento = data.get('evento', 'Evento desconocido')
+        evento = data.get('evento', 'Respuesta desconocida')
         hora = data.get('hora', time.strftime("%Y-%m-%d %H:%M:%S"))
-        print(f"Notificación recibida: {evento} a las {hora}")
+        print(f"Respuesta recibida: {evento} a las {hora}")  # ← Cambiado aquí
         return {"status": "recibido"}, 200
     except Exception as e:
-        print(f"Error recibiendo notificación: {str(e)}")
+        print(f"Error recibiendo respuesta: {str(e)}")
         return {"error": str(e)}, 500
 
 @app.route('/health', methods=['GET'])
 def health_check():
     return {
         "status": "healthy",
-        "service": "Servidor de Notificaciones",
+        "service": "Servidor de Respuestas",
         "timestamp": time.time()
     }
 
 if __name__ == "__main__":
     puerto = int(os.environ.get("PORT", 5002))
-    print("Servidor de Notificaciones iniciando...")
+    print("Servidor de Respuestas iniciando...")
     print(f"Escuchando en 0.0.0.0:{puerto}")
     app.run(host='0.0.0.0', port=puerto, debug=False, threaded=True)
